@@ -1,0 +1,762 @@
+---
+title: 'Applied Predictive Analytics - NFL Home Game Outcome Analysis'
+subtitle: 'Alex Grill - February 2023'
+output:
+  pdf_document: default
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, include = FALSE}
+
+## LOAD PACKAGES ---------------------------------------------------------------
+
+library(tidyverse)
+library(nflverse)
+library(nflfastR)
+library(ggplot2)
+library(ggimage)
+library(gt)
+library(data.table)
+library(psych)
+library(corrplot)
+library(ggpubr)
+library(GGally)
+library(caret)
+library(margins)
+library(broom)
+library(ggeffects)
+library(knitr)
+
+```
+
+```{r, include = FALSE}
+
+### NOTE: THIS CHUNK REQUIRES A LOT OF RAM TO RUN
+  ### AFTER SUCCESSFULLY RUNNING ONE TIME YOU SHOULD HAVE ALL NECESSARY .RDATA FILES LOCALLY SAVED
+    ### CHANGE THE FILE PATHS FOR THE 2 SAVE() FUNCTIONS TO YOUR DESIRED FILE PATH
+
+## DATA CLEANING ---------------------------------------------------------------
+
+## GAMES DATA FRAME CREATION ---------------------------------------------------
+
+## Load NFL schedule data for years 2002-2022 (21 years)
+  ## 2002: NFL expanded to 32 teams and reorganized the conference divisions
+games <- load_schedules(2002:2022)
+
+
+## Alter home and away team names for teams who've relocated in the past 21 years
+games[games$home_team == 'STL', 'home_team'] = 'LA'
+games[games$home_team == 'SD', 'home_team'] = 'LAC'
+games[games$home_team == 'OAK', 'home_team'] = 'LV'
+
+games[games$away_team == 'STL', 'away_team'] = 'LA'
+games[games$away_team == 'SD', 'away_team'] = 'LAC'
+games[games$away_team == 'OAK', 'away_team'] = 'LV'
+
+
+## Filter games down to regular-season level
+  ## Remove unnecessary variables and create 7 new binary variables
+games <- games %>%
+  filter(game_type == "REG") %>%
+  select(game_id, old_game_id, gameday, season, week, weekday, gametime, 
+         home_team, home_score, away_team, away_score, result, total, 
+         spread_line, total_line, div_game, overtime, roof, surface, temp, wind) %>%
+  mutate(
+    home_team_Win = ifelse(home_score > away_score, 1, 0),
+    NFC_matchup = ifelse((home_team %in% c("ARI", "ATL", "CAR", "CHI", 
+                                           "DAL", "DET", "GB", "LA", 
+                                           "MIN", "NO", "NYG", "PHI", 
+                                           "SEA", "SF", "TB", "WAS")) & 
+                           (away_team %in% c("ARI", "ATL", "CAR", "CHI", 
+                                             "DAL", "DET", "GB", "LA",
+                                             "MIN", "NO", "NYG", "PHI", 
+                                             "SEA", "SF", "TB", "WAS")), 1, 0),
+    AFC_matchup = ifelse((home_team %in% c("BAL", "BUF", "CIN", "CLE", 
+                                           "DEN", "HOU", "IND", "JAX", 
+                                           "KC", "LAC", "LV", "MIA",
+                                           "NE", "NYJ",  "PIT", "TEN")) & 
+                           (away_team %in% c("BAL", "BUF", "CIN", "CLE", 
+                                             "DEN", "HOU", "IND", "JAX", 
+                                             "KC", "LAC", "LV", "MIA",
+                                             "NE", "NYJ",  "PIT", "TEN")), 1, 0),
+    grass_field = ifelse(surface == "grass", 1, 0),
+    outdoors = ifelse(roof == "outdoors", 1, 0),
+    home_team_underdog = ifelse(spread_line < 0, 1, 0),
+    home_team_2TD = ifelse(home_score > 14, 1, 0)
+  )
+
+
+## Load NFL play-by-play data for years 2002-2022 (21 years)
+pbp <- load_pbp(2002:2022)  
+
+
+## Create home team offensive stats at game-level 
+GAMEoff_stats <- pbp %>% 
+  filter(season_type == "REG", home_team == posteam) %>%
+  group_by(game_id) %>%
+  summarise(
+    OFFepa_pp = sum(epa, na.rm = TRUE)/n(),
+    ypc_for = sum(rushing_yards, na.rm = TRUE)/sum(rush, na.rm = TRUE),
+    ypa_for = sum (passing_yards, na.rm = TRUE)/sum(pass, na.rm = TRUE),
+    punts = sum(punt_attempt, na.rm = TRUE),
+    sacked = sum(sack, na.rm = TRUE),
+    turnover = sum(interception, na.rm = TRUE) +
+      sum(fumble_lost, na.rm = TRUE),
+    tdc_for = sum(third_down_converted, na.rm = TRUE)/
+      (sum(third_down_converted, na.rm = TRUE) + 
+         sum(third_down_failed, na.rm = TRUE))
+  )
+
+
+## Create home team defensive stats at game-level 
+GAMEdef_stats <- pbp %>% 
+  filter(season_type == "REG", home_team == defteam) %>%
+  group_by(game_id) %>%
+  summarise(
+    DEFepa_pp = sum(epa, na.rm = TRUE)/n(),
+    ypc_against = sum(rushing_yards, na.rm = TRUE)/sum(rush, na.rm = TRUE),
+    ypa_against = sum (passing_yards, na.rm = TRUE)/sum(pass, na.rm = TRUE),
+    forced_punts = sum(punt_attempt, na.rm = TRUE),
+    sacks = sum(sack, na.rm = TRUE),
+    takeaway = sum(interception, na.rm = TRUE) +
+      sum(fumble_forced, na.rm = TRUE),
+    tdc_against = sum(third_down_converted, na.rm = TRUE)/
+      (sum(third_down_converted, na.rm = TRUE) + 
+         sum(third_down_failed, na.rm = TRUE))
+  )  
+
+
+## Create home team offensive red zone scoring percentage metric at game-level 
+GAMEoff_RZstats <- pbp %>% 
+  filter(season_type == "REG", home_team == posteam, yardline_100 <= 20) %>%
+  group_by(game_id) %>%
+  summarise(
+    td = sum(touchdown),
+    drives = n_distinct(drive),
+    RZscoringpct_for = sum(touchdown)/n_distinct(drive)
+  )
+
+
+## Create home team defensive red zone scoring percentage metric at game-level 
+GAMEdef_RZstats <- pbp %>% 
+  filter(season_type == "REG", home_team == defteam, yardline_100 <=20) %>%
+  group_by(game_id) %>%
+  summarise(
+    td = sum(touchdown),
+    drives = n_distinct(drive),
+    RZscoringpct_against = sum(touchdown)/n_distinct(drive)
+  )
+
+
+## Create home team yards per first down (for) metric at game-level 
+GAMEoff_1d <- pbp %>% 
+  filter(season_type == "REG", home_team == posteam, down == 1) %>%
+  group_by(game_id) %>%
+  summarise(
+    yds_1d = sum(yards_gained),
+    plays_1d = n(),
+    ydsper1d_for = sum(yards_gained)/n()
+  )
+
+
+## Create home team yards per first down (against) metric at game-level 
+GAMEdef_1d <- pbp %>% 
+  filter(season_type == "REG", home_team == defteam, down == 1) %>%
+  group_by(game_id) %>%
+  summarise(
+    yds_1d = sum(yards_gained),
+    plays_1d = n(),
+    ydsper1d_against = sum(yards_gained)/n()
+  )
+
+
+## Join all game-level home team stats with games data frame
+games <- games %>%
+  left_join(GAMEoff_stats, by = "game_id") %>%
+  left_join(GAMEdef_stats, by = "game_id") %>%
+  left_join(GAMEoff_RZstats, by = "game_id") %>%
+  left_join(GAMEdef_RZstats, by = "game_id") %>%
+  left_join(GAMEoff_1d, by = "game_id") %>%
+  left_join(GAMEdef_1d, by = "game_id")
+
+
+## Create margin variables
+games$TO_margin <- games$takeaway - games$turnover
+games$sack_margin <- games$sacks - games$sacked
+games$punt_margin <- games$forced_punts - games$punts
+
+
+## Filter games data frame down to 47 variables
+games_filtered <- games %>%
+  select(game_id, old_game_id, gameday, season, week, weekday, gametime,
+         home_team, home_score, away_team, away_score, home_team_Win, result, 
+         overtime, home_team_2TD,  total, spread_line, total_line, home_team_underdog, 
+         outdoors, grass_field, temp, wind, NFC_matchup, AFC_matchup, div_game, 
+         OFFepa_pp, ypc_for, ypa_for, punts, sacked, turnover, tdc_for, 
+         ydsper1d_for, RZscoringpct_for, DEFepa_pp, ypc_against, ypa_against, 
+         forced_punts, sacks, takeaway, tdc_against, ydsper1d_against, RZscoringpct_against, 
+         TO_margin, sack_margin,punt_margin)
+
+
+## Run summary on games_filtered to check variable values/search for NA's
+#summary(games_filtered)
+
+
+## Remove all NA's in the continuous variables
+games_cleaned <- games_filtered %>%
+  drop_na(ydsper1d_for) %>% 
+  drop_na(RZscoringpct_for) %>%
+  drop_na(ydsper1d_against) %>%
+  drop_na(RZscoringpct_against)
+
+
+## Replace NA's in wind and temp variables with variable average
+games_cleaned[is.na(games_cleaned$wind),'wind'] = round(mean(games_cleaned$wind, na.rm = TRUE),0)
+games_cleaned[is.na(games_cleaned$temp),'temp'] = round(mean(games_cleaned$temp, na.rm = TRUE),0)
+
+
+## Run summary on games_cleaned to verify the NA's have been taken care of
+summary(games_cleaned)
+
+
+## Save games_cleaned data
+save(games_cleaned,file = "YOUR PATH/games_cleaned.Rdata")
+
+
+## SEASONS DATA FRAME CREATION -------------------------------------------------
+
+## Begin season-level data frame creation
+seasons <- games %>%
+  group_by(season, home_team) %>%
+  summarise(
+    home_wins = sum(home_team_Win),
+    home_games = n()
+  )
+
+## Making unique row ID variable for join
+seasons$seasonID <- seq.int(nrow(seasons))
+
+
+## Create season-based home team offensive stats
+SZNoff_stats <- pbp %>% 
+  filter(season_type == "REG", home_team == posteam) %>%
+  group_by(season, home_team) %>%
+  summarise(
+    OFFepa_pp = sum(epa, na.rm = TRUE)/n(),
+    ypc_for = sum(rushing_yards, na.rm = TRUE)/sum(rush, na.rm = TRUE),
+    ypa_for = sum (passing_yards, na.rm = TRUE)/sum(pass, na.rm = TRUE),
+    punts = sum(punt_attempt, na.rm = TRUE),
+    sacked = sum(sack, na.rm = TRUE),
+    turnover = sum(interception, na.rm = TRUE) +
+      sum(fumble_lost, na.rm = TRUE),
+    tdc_for = sum(third_down_converted, na.rm = TRUE)/
+      (sum(third_down_converted, na.rm = TRUE) + 
+         sum(third_down_failed, na.rm = TRUE))
+  )
+
+## Making unique row ID variable for join
+SZNoff_stats$seasonID <- seq.int(nrow(SZNoff_stats))
+
+
+## Create season-based home team defensive stats
+SZNdef_stats <- pbp %>% 
+  filter(season_type == "REG", home_team == defteam) %>%
+  group_by(season, home_team) %>%
+  summarise(
+    DEFepa_pp = sum(epa, na.rm = TRUE)/n(),
+    ypc_against = sum(rushing_yards, na.rm = TRUE)/sum(rush, na.rm = TRUE),
+    ypa_against = sum (passing_yards, na.rm = TRUE)/sum(pass, na.rm = TRUE),
+    forced_punts = sum(punt_attempt, na.rm = TRUE),
+    sacks = sum(sack, na.rm = TRUE),
+    takeaway = sum(interception, na.rm = TRUE) +
+      sum(fumble_forced, na.rm = TRUE),
+    tdc_against = sum(third_down_converted, na.rm = TRUE)/
+      (sum(third_down_converted, na.rm = TRUE) + 
+         sum(third_down_failed, na.rm = TRUE))
+  )
+
+## Making unique row ID variable for join
+SZNdef_stats$seasonID <- seq.int(nrow(SZNdef_stats))
+
+
+## Join all home team stats with game level data frame
+seasons <- seasons %>%
+  left_join(SZNoff_stats, by = "seasonID") %>%
+  left_join(SZNdef_stats, by = "seasonID")
+
+
+## Create margin variables
+seasons$TO_margin <- seasons$takeaway - seasons$turnover 
+seasons$sack_margin <- seasons$sacks - seasons$sacked
+seasons$punt_margin <- seasons$forced_punts - seasons$punts
+
+
+## Remove all unnecessary variables
+seasons <- seasons %>%  
+  select(seasonID, season, home_team, home_wins, home_games, OFFepa_pp, DEFepa_pp,
+         ypc_for, ypc_against, ypa_for, ypa_against, tdc_for, tdc_against, 
+         sacks, sacked, punts, forced_punts, turnover, takeaway, TO_margin, 
+         sack_margin, punt_margin)
+
+
+## Check data
+summary(seasons)
+
+
+## Save seasons data
+save(seasons,file = "YOUR PATH/seasons.Rdata")
+
+```
+
+```{r, include = FALSE}
+
+### NOTE: RESTART YOUR R SESSION AND RERUN THE LOAD PACKAGES CHUNK BEFORE MOVING FORWARD
+  ### CHANGE THE LOAD() FUNCTION FILE PATH TO YOUR DESIRED FILE PATH
+
+## EXPLORATORY ANALYSIS --------------------------------------------------------
+
+## Load in games_cleaned
+load("YOUR PATH/games_cleaned.Rdata")
+
+
+## Our dependent variable of interest: home_team_Win
+table(games_cleaned$home_team_Win)
+prop.table(table(games_cleaned$home_team_Win))
+
+
+## How are the variables correlated with the rating?
+ggcorr(bind_cols(games_cleaned %>% select(home_team_Win), games_cleaned %>% select(-home_team_Win)))
+
+
+## How does Home Team Win sum vary by matchup type?
+WinsByMatchup <- games_cleaned %>% 
+  select(home_team_Win, NFC_matchup:div_game) %>% 
+  gather(Matchup, HomeWin, NFC_matchup:div_game) %>% 
+  group_by(Matchup, HomeWin) %>% 
+  summarise(Wins = sum(home_team_Win)) %>%
+  mutate(Matchup = ifelse(Matchup == "AFC_matchup", "AFC Matchup",
+                        ifelse(Matchup == "NFC_matchup", "NFC Matchup",
+                              "Divsional Matchup")))
+
+  
+## WinsByMatchup Plot
+ggplot(WinsByMatchup, aes(x = Matchup, y = Wins, fill = factor(HomeWin))) + 
+  geom_bar(stat="identity", position=position_dodge()) + 
+  theme_bw(15) +
+  ylab(NULL) + xlab(NULL) + 
+  coord_cartesian(ylim=c(1, 1800)) + 
+  scale_fill_discrete(name = NULL, labels = c("Loss","Win")) +
+  theme(axis.text = element_text(size = 10)) +
+  ggtitle("Home Team Outcome by Matchup Type")
+
+```
+
+```{r, include = FALSE}
+
+## MODEL CREATION PROCESS ------------------------------------------------------
+
+## Filter games_cleaned to 17 numeric variables
+games_Reg <- games_cleaned[c("home_team_Win", "NFC_matchup", "AFC_matchup", "div_game", 
+                             "ypc_for", "ypa_for", "tdc_for", "ydsper1d_for", "RZscoringpct_for",
+                             "ypc_against", "ypa_against", "tdc_against", "ydsper1d_against", 
+                             "RZscoringpct_against", "TO_margin", "sack_margin", "punt_margin")]
+
+
+## Change column names to be more clear 
+colnames(games_Reg) <- c("HTeamWin","NFC_Matchup", "AFC_Matchup", "Div_Matchup", "YardsPerCarry_For", 
+                         "YardsPerAttempt_For", "ThirdDownConversionRate_For", "YardsPerFirstDown_For", 
+                         "RedZoneScoringPCT_For", "YardsPerCarry_Against", "YardsPerAttempt_Against", 
+                         "ThirdDownConversionRate_Against", "YardsPerFirstDown_Against", "RedZoneScoringPCT_Against", 
+                         "TO_Margin", "Sack_Margin", "Punt_Margin") 
+
+
+## Logistic Regression with games_17v
+logReg0 <- glm(HTeamWin ~ ., games_Reg, family = binomial)
+
+
+## Results, remove NFC_Matchup and AFC_Matchup
+summary(logReg0)
+games_Reg1 <- select(games_Reg, -NFC_Matchup, -AFC_Matchup)
+
+
+## New logistic regression
+logReg1 <- glm(HTeamWin ~ ., games_Reg1, family = binomial)
+
+
+## Results, remove Div_Matchup
+summary(logReg1)
+games_Reg2 <- select(games_Reg1, -Div_Matchup)
+
+
+## New logistic regression
+logReg2 <- glm(HTeamWin ~ ., games_Reg2, family = binomial)
+
+
+## Results, remove YardsPerFirstDown_Against
+summary(logReg2)
+games_Reg3 <- select(games_Reg2, -YardsPerFirstDown_Against)
+
+
+## New logistic regression
+logReg3 <- glm(HTeamWin ~ ., games_Reg3, family = binomial)
+
+
+## Results
+summary(logReg3)
+
+```
+
+```{r, include = FALSE}
+
+## MODEL SELECTION & PREDICTIVE ACCURACY MATRIX -------------------------------- 
+
+## Decide on a model:
+  ## Most fit model out of games_Reg data frame (compared AIC values): logReg2
+logRegFin = logReg2
+
+
+## Predictive accuracy
+pred = predict(logRegFin,type="response") #This is the probability that the score is a "good score"
+pred[pred>=.5] = "HTeamWin"
+pred[pred!="HTeamWin"] = "HTeamLossOrTie"
+
+
+## Classification matrix
+classMatrix <- table(pred,games_Reg2$HTeamWin)  #first variable is by row, the second is by column
+classMatrix
+
+
+## Accuracy of the classification matrix (the model predicts whether the home team wins or loses with 85.36% accuracy)
+sum(diag(classMatrix))/sum(classMatrix)
+
+```
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.dim = c(10, 3.5), fig.align = 'center')
+```
+
+```{r, include = TRUE}
+
+## FINAL REGRESSION: FEATURE VARIABLE IMPORTANCE PLOT --------------------------
+
+## Use the varImp() function from the caret package to calculate feature importance
+imp <- varImp(logRegFin)
+
+
+## Create a data frame with the feature names and their importance scores
+imp_df <- data.frame(Feature = row.names(imp),
+                     Importance = imp$Overall)
+
+
+## Make variables names look cleaner for plot
+imp_df <- imp_df %>%
+  mutate(FeatureNewName = ifelse(Feature == "TO_Margin", "Turnover Margin", 
+                          ifelse(Feature == "YardsPerAttempt_For", "Yards Per Attempt",
+                          ifelse(Feature == "YardsPerAttempt_Against", "Yards Per Attempt Allowed",
+                          ifelse(Feature == "ThirdDownConversionRate_Against", "Third Down Conversion Rate Allowed", 
+                          ifelse(Feature == "ThirdDownConversionRate_For", "Third Down Conversion Rate",
+                          ifelse(Feature == "Sack_Margin", "Sack Margin",
+                          ifelse(Feature == "Punt_Margin", "Punt Margin",
+                          ifelse(Feature == "YardsPerCarry_Against", "Yards Per Carry Allowed",                          
+                          ifelse(Feature == "YardsPerCarry_For", "Yards Per Carry",
+                          ifelse(Feature == "RedZoneScoringPCT_For", "Red Zone Scoring Percentage",
+                          ifelse(Feature == "RedZoneScoringPCT_Against", "Red Zone Scoring Percentage Allowed",
+                          ifelse(Feature == "YardsPerFirstDown_For", "Yards Per First Down",
+                                 "Yards Per First Down Allowed")))))))))))))
+
+
+## Plot the feature importance using ggplot
+imp_plot <- imp_df %>%
+  ggplot(aes(x = reorder(FeatureNewName, Importance), 
+             y = Importance, fill = Importance)) +
+  coord_flip() +
+  geom_bar(stat = "identity") +
+  labs(x = NULL,
+       y = "Feature Variable Importance",
+       title = NULL) +
+  scale_fill_gradient(low = "grey", high = "blue") +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5), 
+        axis.text.y = element_text(size = 8),
+        #plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),
+        legend.position = "none"
+        )
+
+annotate_figure(imp_plot,
+                top = text_grob("Feature Importance in Logistic Regression Model", 
+                                color = "black", face = "bold", size = 14))
+
+```
+
+```{r, inlcude = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.dim = c(8, 3))
+```
+
+```{r, include = TRUE}
+
+### NOTE: CHANGE THE LOAD() FUNCTION FILE PATH TO YOUR DESIRED FILE PATH
+
+## HISTORICAL PERFORMANCE IN TOP 3 FEATURE VARIABLES PLOT ---------------------- 
+
+## Load in seasons
+load("YOUR PATH/seasons.Rdata")
+
+
+## Take seasons data and get it down to the per team average level
+historic_HTaverages <- seasons %>%
+  group_by(home_team) %>%
+  summarize(
+    avg_HomeWins = mean(home_wins),
+    avg_HomeWinPct = sum(home_wins)/sum(home_games),
+    avg_TO_Margin = mean(TO_margin),
+    avg_YardsPerAttempt_For = mean(ypa_for),
+    avg_YardsPerAttempt_Against = mean(ypa_against),
+    avg_ThirdDownConversionRate_For = mean(tdc_for),
+    avg_ThirdDownConversionRate_Against = mean(tdc_against),
+    avg_Sack_Margin = mean(sack_margin)
+  )
+
+
+## Join historic average data frame onto team images table
+historic_HTaverages <- historic_HTaverages %>%
+  left_join(teams_colors_logos, by = c("home_team" = "team_abbr"))
+
+
+## Create plots for 3 most important regression variables
+
+## A: HomeWin v TO_Margin
+A <- historic_HTaverages %>%
+  ggplot(aes(x = avg_TO_Margin, y = avg_HomeWins)) +
+  geom_hline(yintercept = mean(historic_HTaverages$avg_HomeWins), color = "red", linetype = "dashed") +
+  geom_vline(xintercept = mean(historic_HTaverages$avg_TO_Margin), color = "red", linetype = "dashed") +
+  geom_image(aes(image = team_logo_espn), size = 0.05, asp = 16/9) +
+  theme_bw() +
+  labs(x = "Average Turnover Magin",
+       y = "Average Home Wins",
+       title = NULL,
+       subtitle = "Variable Importance Rank: 1") +
+  theme(plot.subtitle = element_text(size = 9.5, hjust = 0),
+        axis.title.x = element_text(size = 10, angle = 0, hjust = 0.5),
+        axis.title.y = element_text(size = 8.5, hjust = 0.5),
+        axis.text = element_text(size = 7.5)
+        )
+
+
+## B: HomeWin v YardsPerAttempt_For
+B <- historic_HTaverages %>%
+  ggplot(aes(x = avg_YardsPerAttempt_For, y = avg_HomeWins)) +
+  geom_hline(yintercept = mean(historic_HTaverages$avg_HomeWins), color = "red", linetype = "dashed") +
+  geom_vline(xintercept = mean(historic_HTaverages$avg_YardsPerAttempt_For), color = "red", linetype = "dashed") +
+  geom_image(aes(image = team_logo_espn), size = 0.05, asp = 16/9) +
+  theme_bw() +
+  labs(x = "Average Yards Per Attempt",
+       y = "Average Home Wins",
+       title = NULL,
+       subtitle = "Variable Importance Rank: 2") +
+  theme(plot.subtitle = element_text(size = 9.5, hjust = 0),
+        axis.title.x = element_text(size = 10, angle = 0, hjust = 0.5),
+        axis.title.y = element_text(size = 8.5, hjust = 0.5),
+        axis.text = element_text(size = 7.5)
+        )
+
+
+## C: HomeWin v YardsPerPassAttempt_Against
+C <- historic_HTaverages %>%
+  ggplot(aes(x = avg_YardsPerAttempt_Against, y = avg_HomeWins)) +
+  geom_hline(yintercept = mean(historic_HTaverages$avg_HomeWins), color = "red", linetype = "dashed") +
+  geom_vline(xintercept = mean(historic_HTaverages$avg_YardsPerAttempt_Against), color = "red", linetype = "dashed") +
+  geom_image(aes(image = team_logo_espn), size = 0.05, asp = 16/9) +
+  theme_bw() +
+  labs(x = "Average Yards Per Attempt Allowed",
+       y = "Average Home Wins",
+       title = NULL,
+       subtitle = "Variable Importance Rank: 3") +
+  theme(plot.subtitle = element_text(size = 9.5, hjust = 0),
+        axis.title.x = element_text(size = 10, angle = 0, hjust = 0.5),
+        axis.title.y = element_text(size = 8.5, hjust = 0.5),
+        axis.text = element_text(size = 7.5)
+        )
+
+
+## Put plots in a 3X1 Grid
+Top3V_Plot <- ggarrange(plotlist = list(A, B, C), ncol = 3, nrow = 1)
+
+
+annotate_figure(Top3V_Plot,
+                top = text_grob("Historical NFL Team Performance in Top 3 Regression Variables", 
+                                color = "black", face = "bold", size = 12))
+                #text_grob("(All 32 NFL Teams, Seasons 2002-2022)", 
+                          #color = "black", face = "bold.italic", size = 12))
+
+```
+
+```{r, include = TRUE}
+
+## MARGINAL EFFECT OF FEATURE VARIABLE 1 TABLE ---------------------------------
+
+## Make a table of To_Margin probability
+TO_Mprob <- ggpredict(logRegFin, terms = "TO_Margin [-3:3 by=1]") %>% 
+  mutate(
+    predictedround = round(predicted, 3), 
+    cilow = round(conf.low,3), 
+    cihigh = round(conf.high,3)
+    ) %>%
+  select(x, predictedround, cilow, cihigh) %>% 
+  rename(
+    "Home Team Turnover Margin" = x, 
+    "Probability of Home Win" = predictedround,
+    "95% CI Lower Bound" = cilow, 
+    "95% CI Upper Bound" = cihigh
+    )
+
+
+## Add Change in Win Probability Column
+TO_Mprob['Change in Win Probaility'] = 0
+TO_Mprob[2,5] = TO_Mprob[2,2] - TO_Mprob[1,2]
+TO_Mprob[3,5] = TO_Mprob[3,2] - TO_Mprob[1,2]
+TO_Mprob[4,5] = TO_Mprob[4,2] - TO_Mprob[1,2]
+TO_Mprob[5,5] = TO_Mprob[5,2] - TO_Mprob[1,2]
+TO_Mprob[6,5] = TO_Mprob[6,2] - TO_Mprob[1,2]
+TO_Mprob[7,5] = TO_Mprob[7,2] - TO_Mprob[1,2]
+
+
+TO_Mprob %>%
+  select(-"95% CI Lower Bound", -"95% CI Upper Bound") %>%
+  kable()
+
+```
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.dim = c(4, 2), fig.align = 'center')
+```
+
+```{r, include = FALSE}
+
+## MARGINAL EFFECT OF FEATURE VARIABLE 1 PLOT ----------------------------------
+
+## Make a plot of To_Margin probability
+TO_Margin_Plot <- ggpredict(logRegFin, terms = "TO_Margin[-4:4]") 
+plot(TO_Margin_Plot) + 
+  labs(
+  x = "Home Team Turnover Margin", 
+  y = "Probability of Home Win", 
+  title = NULL
+  ) +
+  scale_x_continuous(breaks=c(-3, -2, -1, 0, 1, 2, 3)) +
+  theme(axis.title.x = element_text(size = 8, angle = 0, hjust = 0.5),
+        axis.title.y = element_text(size = 8, hjust = 0.5),
+        axis.text = element_text(size = 7.5)
+        )
+
+```
+
+```{r, include = FALSE}
+
+## MARGINAL EFFECT OF FEATURE VARIABLE 2 TABLE ---------------------------------
+
+## Make a table of YardsPerAttempt_For probability
+YardsPerAttemptForprob <- ggpredict(logRegFin, terms = "YardsPerAttempt_For [0:10 by=2.5]") %>% 
+  mutate(
+    predictedround = round(predicted, 3), 
+    cilow = round(conf.low,3), 
+    cihigh = round(conf.high,3)
+    ) %>%
+  select(x, predictedround, cilow, cihigh) %>%
+  rename(
+    "Home Team Yards Per Attempt" = x, 
+    "Probability of Home Win" = predictedround,
+    "95% CI Lower Bound" = cilow, 
+    "95% CI Upper Bound" = cihigh
+    )
+
+
+## Add Change in Win Probability Column
+YardsPerAttemptForprob['Change in Win Probaility'] = 0
+YardsPerAttemptForprob[2,5] = YardsPerAttemptForprob[2,2] - YardsPerAttemptForprob[1,2]
+YardsPerAttemptForprob[3,5] = YardsPerAttemptForprob[3,2] - YardsPerAttemptForprob[1,2]
+YardsPerAttemptForprob[4,5] = YardsPerAttemptForprob[4,2] - YardsPerAttemptForprob[1,2]
+YardsPerAttemptForprob[5,5] = YardsPerAttemptForprob[5,2] - YardsPerAttemptForprob[1,2]
+
+
+YardsPerAttemptForprob %>%
+  select(-"95% CI Lower Bound", -"95% CI Upper Bound") %>%
+  kable()
+
+```
+
+```{r, include = FALSE}
+
+## MARGINAL EFFECT OF FEATURE VARIABLE 3 TABLE ---------------------------------
+
+## Make a table of YardsPerAttempt_Against probability
+YardsPerAttemptAgainstprob <- ggpredict(logRegFin, terms = "YardsPerAttempt_Against [0:10 by=2.5]") %>% 
+  mutate(
+    predictedround = round(predicted, 3), 
+    cilow = round(conf.low,3), 
+    cihigh = round(conf.high,3)
+    ) %>%
+  select(x, predictedround, cilow, cihigh) %>% 
+  rename(
+    "Home Team Yards Per Attempt Allowed" = x, 
+    "Probability of Home Win" = predictedround, 
+    "95% CI Lower Bound" = cilow, 
+    "95% CI Upper Bound" = cihigh
+    )
+
+
+## Add Change in Win Probability Column
+YardsPerAttemptAgainstprob['Change in Win Probaility'] = 0
+YardsPerAttemptAgainstprob[2,5] = YardsPerAttemptAgainstprob[2,2] - YardsPerAttemptAgainstprob[1,2]
+YardsPerAttemptAgainstprob[3,5] = YardsPerAttemptAgainstprob[3,2] - YardsPerAttemptAgainstprob[1,2]
+YardsPerAttemptAgainstprob[4,5] = YardsPerAttemptAgainstprob[4,2] - YardsPerAttemptAgainstprob[1,2]
+YardsPerAttemptAgainstprob[5,5] = YardsPerAttemptAgainstprob[5,2] - YardsPerAttemptAgainstprob[1,2]
+
+
+YardsPerAttemptAgainstprob %>%
+  select(-"95% CI Lower Bound", -"95% CI Upper Bound") %>%
+  kable()
+
+```
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.dim = c(8, 2.5), fig.align = 'center')
+```
+
+```{r, include = TRUE}
+
+## MARGINAL EFFECT OF FEATURE VARIABLE 2 & 3 PLOT ------------------------------
+
+## Make a plot of YardsPerAttempt_For probability
+YardsPerAttemptFor_Plot <- ggpredict(logRegFin, terms = "YardsPerAttempt_For [0:15]") %>% 
+  plot() + 
+  labs(
+  x = "Home Team Yards Per Atttempt", 
+  y = "Probability of Home Win", 
+  title = NULL
+  ) +
+  scale_x_continuous(n.breaks = 7) +
+  theme(axis.title.x = element_text(size = 8, angle = 0, hjust = 0.5),
+        axis.title.y = element_text(size = 8, hjust = 0.5),
+        axis.text = element_text(size = 7.5)
+        )
+
+
+## Make a plot of YardsPerAttempt_Against probability
+YardsPerAttemptAgainst_Plot <- ggpredict(logRegFin, terms = "YardsPerAttempt_Against[0:15]") %>%
+  plot() + 
+  labs(
+  x = "Home Team Yards Per Atttempt Allowed", 
+  y = "Probability of Home Win", 
+  title = NULL
+  ) +
+  scale_x_continuous(n.breaks = 7) +
+  theme(axis.title.x = element_text(size = 8, angle = 0, hjust = 0.5),
+        axis.title.y = element_text(size = 8, hjust = 0.5),
+        axis.text = element_text(size = 7.5)
+        )
+
+ggarrange(plotlist = list(YardsPerAttemptFor_Plot, YardsPerAttemptAgainst_Plot), ncol = 2, nrow = 1)
+
+```
